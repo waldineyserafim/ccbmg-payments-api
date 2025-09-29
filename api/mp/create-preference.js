@@ -3,7 +3,7 @@ import { mpPreference } from "../_mp.js";
 
 const PLAN_MONTHS = { mensal:1, trimestral:3, semestral:6 };
 const PLAN_LABEL  = { mensal:"Mensal", trimestral:"Trimestral", semestral:"Semestral" };
-const PLAN_PRICE  = { mensal:30, trimestral:85, semestral:170 }; // ajuste valores aqui
+const PLAN_PRICE  = { mensal:30, trimestral:85, semestral:170 };
 
 function addMonthsSafe(d, m){
   const x=new Date(d); const day=x.getDate();
@@ -13,7 +13,6 @@ function addMonthsSafe(d, m){
 }
 
 export default async function handler(req, res){
-  // CORS p/ o seu domínio do site
   const ALLOW_ORIGIN = "https://clubedocavalobonfim.com.br";
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
@@ -32,12 +31,10 @@ export default async function handler(req, res){
 
     const amount = PLAN_PRICE[planType];
 
-    // define ciclo
     const start = new Date(); start.setHours(0,0,0,0);
     const end = addMonthsSafe(start, PLAN_MONTHS[planType]);
     const due = end;
 
-    // cria fatura em_aberto em users/{uid}/financeInvoices
     const invRef = await db.collection("users").doc(uid)
       .collection("financeInvoices").add({
         planType, planName: PLAN_LABEL[planType],
@@ -49,7 +46,6 @@ export default async function handler(req, res){
         recordedAt: FieldValue.serverTimestamp()
       });
 
-    // cria preferência (Checkout Pro) — SDK v2
     const pref = await mpPreference.create({
       body: {
         items: [{
@@ -79,4 +75,3 @@ export default async function handler(req, res){
     return res.status(500).json({ error: e.message });
   }
 }
-
