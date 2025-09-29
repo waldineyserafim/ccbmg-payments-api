@@ -5,7 +5,7 @@ const PLAN_MONTHS = { mensal: 1, trimestral: 3, semestral: 6 };
 const PLAN_LABEL  = { mensal: "Mensal", trimestral: "Trimestral", semestral: "Semestral" };
 const PLAN_PRICE  = { mensal: 30, trimestral: 85, semestral: 170 };
 
-// --- CORS dinâmico: permite produção e ambiente local de teste ---
+// -------- CORS (produção + local) --------
 const ORIGINS = new Set([
   "https://clubedocavalobonfim.com.br",
   "http://127.0.0.1:5500",
@@ -18,7 +18,6 @@ function setCors(res, origin) {
   if (origin && ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // Fallback seguro: domínio de produção
     res.setHeader("Access-Control-Allow-Origin", "https://clubedocavalobonfim.com.br");
   }
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -33,7 +32,6 @@ function addMonthsSafe(d, m) {
 }
 
 export default async function handler(req, res) {
-  // Libera CORS (produção + local) e responde preflight
   setCors(res, req.headers.origin);
   if (req.method === "OPTIONS") return res.status(204).end();
 
@@ -47,12 +45,12 @@ export default async function handler(req, res) {
 
     const amount = PLAN_PRICE[planType];
 
-    // Define ciclo do plano
+    // período do plano
     const start = new Date(); start.setHours(0, 0, 0, 0);
-    const end = addMonthsSafe(start, PLAN_MONTHS[planType]);
-    const due = end;
+    const end   = addMonthsSafe(start, PLAN_MONTHS[planType]);
+    const due   = end;
 
-    // Cria fatura "em_aberto"
+    // cria fatura em_aberto
     const invRef = await db.collection("users").doc(uid)
       .collection("financeInvoices").add({
         planType, planName: PLAN_LABEL[planType],
@@ -64,7 +62,7 @@ export default async function handler(req, res) {
         recordedAt: FieldValue.serverTimestamp()
       });
 
-    // Cria a preferência (Checkout Pro) — SDK v2
+    // preferência Checkout Pro
     const pref = await mpPreference.create({
       body: {
         items: [{
@@ -85,23 +83,37 @@ export default async function handler(req, res) {
       }
     });
 
-    // ✅ Prioriza sandbox quando o token é de TESTE
-    const isTest = (process.env.MP_ACCESS_TOKEN || "").startsWith("TEST-");
-    const init_point = isTest
-      ? (pref.sandbox_init_point || pref.init_point)
-      : (pref.init_point || pref.sandbox_init_point);
+    // --- Escolha correta do link (sandbox x produção) ---
+    const token = process.env.MP_ACCESS_TOKEN || "";
+    const isTestEnv = token.startsWith("TEST-");
+
+    // URLs cruas que a API retornou (para debug)
+    const rawInit   = pref.init_point || null;
+    const rawSandbox= pref.sandbox_init_point || null;
+
+    // Fallbacks defensivos para garantir sandbox/prod coerente
+    const toSandbox = (url) =>
+      url ? url.replace("://www.mercadopago.com", "://sandbox.mercadopago.com") : null;
+    const toProd = (url) =>
+      url ? url.replace("://sandbox.mercadopago.com", "://www.mercadopago.com") : null;
+
+    let init_point;
+    if (isTestEnv) {
+      init_point = rawSandbox || toSandbox(rawInit) || rawInit; // força sandbox
+    } else {
+      init_point = rawInit || toProd(rawSandbox) || rawSandbox; // produção
+    }
 
     await invRef.update({ paymentUrl: init_point, preferenceId: pref.id });
 
-    // (Opcional) já deixa o summary com próximo vencimento preparado
-    // const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
-    // await summaryRef.set({
-    //   planType,
-    //   nextDue: Timestamp.fromDate(end),
-    //   updatedAt: FieldValue.serverTimestamp()
-    // }, { merge: true });
-
-    return res.status(200).json({ init_point, preference_id: pref.id });
+    return res.status(200).json({
+      init_point,
+      preference_id: pref.id,
+      // campos extras de debug (úteis só durante testes):
+      env: isTestEnv ? "sandbox (TEST token)" : "production",
+      raw_init_point: rawInit,
+      raw_sandbox_init_point: rawSandbox
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message });
