@@ -32,13 +32,30 @@ function addMonthsSafe(d, m){
   return x;
 }
 
+// Validação simples de CPF
+function isValidCPF(cpf) {
+  const v = String(cpf || "").replace(/\D/g,"");
+  if (!/^\d{11}$/.test(v) || /^(\d)\1{10}$/.test(v)) return false;
+  const calc = (base) => {
+    let sum = 0;
+    for (let i=0;i<base.length;i++) sum += parseInt(base[i],10) * (base.length+1-i);
+    const r = sum % 11;
+    return (r < 2) ? 0 : 11 - r;
+  };
+  const d1 = calc(v.slice(0,9));
+  const d2 = calc(v.slice(0,9)+d1);
+  return v.endsWith(`${d1}${d2}`);
+}
+
 export default async function handler(req, res){
   setCors(res, req.headers.origin);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST")   return res.status(405).end();
 
-  // Detecta se o servidor está com token de TESTE (útil para defaults)
-  const isTestServer = (process.env.MP_ACCESS_TOKEN || "").startsWith("TEST-");
+  // Ambiente de TESTE: definido por MP_ENV=TEST ou origem local (localhost/127.*)
+  const origin = req.headers.origin || "";
+  const isLocalOrigin = /localhost|127\.0\.0\.1/.test(origin);
+  const isTestEnv = String(process.env.MP_ENV || "").toUpperCase() === "TEST" || isLocalOrigin;
 
   try {
     const { uid, planType = "mensal", formData } = req.body || {};
@@ -74,10 +91,25 @@ export default async function handler(req, res){
     } = formData;
 
     const payerEmail = payer.email || formData.email || "comprador+teste@ccbmg.dev";
-    // CPF é obrigatório em cartão/ boleto no BR. Se vier vazio no sandbox, preenche com CPF de teste.
-    const payerIdType   = (payer.identification && payer.identification.type) || "CPF";
-    const payerIdNumber = (payer.identification && payer.identification.number)
-                       || (isTestServer ? "19119119100" : undefined);
+    let payerIdType   = (payer.identification && payer.identification.type) || "CPF";
+    let payerIdNumber = (payer.identification && payer.identification.number) || "";
+
+    // Regras por tipo
+    const isCard   = payment_type_id === "credit_card" || payment_type_id === "debit_card";
+    const isPix    = payment_method_id === "pix" || payment_type_id === "pix" || payment_type_id === "bank_transfer";
+    const isBoleto = payment_type_id === "ticket";
+
+    // CPF obrigatório para cartão e boleto
+    if (isCard || isBoleto) {
+      if (!isValidCPF(payerIdNumber)) {
+        if (isTestEnv) {
+          payerIdNumber = "19119119100"; // CPF de teste
+          payerIdType = "CPF";
+        } else {
+          return res.status(400).json({ error: "CPF do pagador é obrigatório para cartão/boleto." });
+        }
+      }
+    }
 
     // Monta o pagamento conforme método
     const body = {
@@ -91,16 +123,11 @@ export default async function handler(req, res){
       metadata: { uid, planType, invoiceId: invRef.id },
       payer: {
         email: payerEmail,
-        identification: payerIdNumber ? { type: payerIdType, number: String(payerIdNumber) } : undefined,
+        identification: (isCard || isBoleto) ? { type: payerIdType, number: String(payerIdNumber) } : undefined,
         first_name: payer.first_name || "Cliente",
         last_name:  payer.last_name  || "CCBMG"
       }
     };
-
-    // Regras por tipo
-    const isCard = payment_type_id === "credit_card" || payment_type_id === "debit_card";
-    const isPix  = payment_method_id === "pix" || payment_type_id === "pix" || payment_type_id === "bank_transfer";
-    const isBoleto = payment_type_id === "ticket";
 
     if (isCard) {
       if (!token)   return res.status(400).json({ error: "Token do cartão ausente." });
@@ -108,7 +135,6 @@ export default async function handler(req, res){
       if (issuer_id) body.issuer_id = issuer_id;
     }
     // PIX não precisa de token
-    // Boleto requer identificação (já resolvido acima) e nome do pagador.
 
     // Tenta criar pagamento
     let pay;
