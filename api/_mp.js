@@ -6,4 +6,3 @@ export const mpClient = new MercadoPagoConfig({
 
 export const mpPreference = new Preference(mpClient);
 export const mpPayment = new Payment(mpClient);
-
