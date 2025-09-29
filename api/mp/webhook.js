@@ -5,13 +5,11 @@ export default async function handler(req, res){
   try{
     if (req.method !== "POST") return res.status(405).end();
 
-    // MP envia { type:"payment", data:{ id } }
     const { type, data } = req.body || {};
     if (type !== "payment" || !data?.id) {
       return res.status(200).json({ ok:true, ignored:true });
     }
 
-    // busca pagamento no MP (servidor) — SDK v2
     const p = await mpPayment.get({ id: data.id });
 
     const uid = p.metadata?.uid;
@@ -36,7 +34,6 @@ export default async function handler(req, res){
 
     await invRef.set(patch, { merge:true });
 
-    // atualiza resumo (nextDue = planEnd dessa fatura)
     const invSnap = await invRef.get();
     const inv = invSnap.data() || {};
     const summaryRef = db.collection("users").doc(uid)
@@ -52,8 +49,6 @@ export default async function handler(req, res){
     return res.status(200).json({ ok:true });
   }catch(e){
     console.error(e);
-    // devolvemos 200 para evitar reenfileiramento infinito; logamos o erro
     return res.status(200).json({ ok:false, error: e.message });
   }
 }
-
