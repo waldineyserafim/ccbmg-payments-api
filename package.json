@@ -4,8 +4,7 @@
   "type": "module",
   "engines": { "node": ">=18" },
   "dependencies": {
-    "firebase-admin": "^12.6.0"
+    "firebase-admin": "^12.5.0",
+    "mercadopago": "^2.2.0"
   }
 }
-
-
