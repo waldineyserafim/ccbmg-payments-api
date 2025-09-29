@@ -16,18 +16,14 @@ export default async function handler(req, res){
   try{
     const today = new Date(); today.setHours(0,0,0,0);
 
-    // pega todos os docs na subcoleção "finance" com nextDue <= hoje
     const q = await db.collectionGroup("finance")
-      .where("nextDue", "<=", Timestamp.fromDate(today))
-      .get();
+      .where("nextDue", "<=", Timestamp.fromDate(today)).get();
 
     const jobs = q.docs.map(async docSnap=>{
       const summary = docSnap.data() || {};
-      // users/{uid}/finance/summary  -> parent.parent = users/{uid}
       const uid = docSnap.ref.parent.parent.id;
       const planType = summary.planType || "mensal";
 
-      // Evita duplicação: se já existe fatura em aberto recente, ignore
       const openInvs = await db.collection("users").doc(uid)
         .collection("financeInvoices")
         .where("status", "==", "em_aberto")
@@ -35,7 +31,6 @@ export default async function handler(req, res){
         .get();
       if (!openInvs.empty) return;
 
-      // novo ciclo: start = nextDue, end = nextDue + N meses
       const start = summary.nextDue?.toDate ? summary.nextDue.toDate() : new Date(summary.nextDue);
       const end   = addMonthsSafe(start, PLAN_MONTHS[planType]);
       const amount = PLAN_PRICE[planType];
@@ -82,4 +77,3 @@ export default async function handler(req, res){
     return res.status(200).json({ ok:false, error: e.message });
   }
 }
-
