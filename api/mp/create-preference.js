@@ -1,40 +1,60 @@
 import { db, Timestamp, FieldValue } from "../_firebase.js";
 import { mpPreference } from "../_mp.js";
 
-const PLAN_MONTHS = { mensal:1, trimestral:3, semestral:6 };
-const PLAN_LABEL  = { mensal:"Mensal", trimestral:"Trimestral", semestral:"Semestral" };
-const PLAN_PRICE  = { mensal:30, trimestral:85, semestral:170 };
+const PLAN_MONTHS = { mensal: 1, trimestral: 3, semestral: 6 };
+const PLAN_LABEL  = { mensal: "Mensal", trimestral: "Trimestral", semestral: "Semestral" };
+const PLAN_PRICE  = { mensal: 30, trimestral: 85, semestral: 170 };
 
-function addMonthsSafe(d, m){
-  const x=new Date(d); const day=x.getDate();
-  x.setMonth(x.getMonth()+m);
-  if(x.getDate()<day) x.setDate(0);
+// --- CORS dinâmico: permita produção e ambientes locais de teste ---
+const ORIGINS = new Set([
+  "https://clubedocavalobonfim.com.br",
+  "http://127.0.0.1:5500",
+  "http://localhost:5500",
+  "http://localhost:3000"
+]);
+
+function setCors(res, origin) {
+  res.setHeader("Vary", "Origin"); // para caches/CDNs
+  if (origin && ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    // fallback seguro: domínio de produção
+    res.setHeader("Access-Control-Allow-Origin", "https://clubedocavalobonfim.com.br");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+function addMonthsSafe(d, m) {
+  const x = new Date(d); const day = x.getDate();
+  x.setMonth(x.getMonth() + m);
+  if (x.getDate() < day) x.setDate(0);
   return x;
 }
 
-export default async function handler(req, res){
-  const ALLOW_ORIGIN = "https://clubedocavalobonfim.com.br";
+export default async function handler(req, res) {
+  // CORS (produção + local)
+  setCors(res, req.headers.origin);
   if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    return res.status(200).end();
+    return res.status(204).end(); // preflight OK
   }
-  res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
 
-  try{
-    if (req.method!=="POST") return res.status(405).end();
-    const { uid, planType="mensal" } = req.body || {};
+  try {
+    if (req.method !== "POST") return res.status(405).end();
+
+    const { uid, planType = "mensal" } = req.body || {};
     if (!uid || !PLAN_MONTHS[planType]) {
-      return res.status(400).json({ error:"Parâmetros inválidos" });
+      return res.status(400).json({ error: "Parâmetros inválidos" });
     }
 
     const amount = PLAN_PRICE[planType];
 
-    const start = new Date(); start.setHours(0,0,0,0);
+    // ciclo atual
+    const start = new Date(); start.setHours(0, 0, 0, 0);
     const end = addMonthsSafe(start, PLAN_MONTHS[planType]);
     const due = end;
 
+    // cria fatura em_aberto
     const invRef = await db.collection("users").doc(uid)
       .collection("financeInvoices").add({
         planType, planName: PLAN_LABEL[planType],
@@ -46,6 +66,7 @@ export default async function handler(req, res){
         recordedAt: FieldValue.serverTimestamp()
       });
 
+    // preferência do Checkout Pro (SDK v2)
     const pref = await mpPreference.create({
       body: {
         items: [{
@@ -69,8 +90,16 @@ export default async function handler(req, res){
     const init_point = pref.init_point || pref.sandbox_init_point;
     await invRef.update({ paymentUrl: init_point, preferenceId: pref.id });
 
+    // (opcional) já grava/atualiza summary com próximo vencimento
+    // const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
+    // await summaryRef.set({
+    //   planType,
+    //   nextDue: Timestamp.fromDate(end),
+    //   updatedAt: FieldValue.serverTimestamp()
+    // }, { merge: true });
+
     return res.status(200).json({ init_point, preference_id: pref.id });
-  }catch(e){
+  } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message });
   }
