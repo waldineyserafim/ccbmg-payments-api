@@ -47,6 +47,15 @@ function isValidCPF(cpf) {
   return v.endsWith(`${d1}${d2}`);
 }
 
+function unwrapMpError(err) {
+  // Tenta extrair mensagem/código padrão do MP
+  const data = err?.response?.data || {};
+  const cause = Array.isArray(data?.cause) ? data.cause[0] : null;
+  const description = cause?.description || data?.message || data?.error || err?.message || "Erro ao criar pagamento no Mercado Pago";
+  const code = cause?.code || data?.status || err?.response?.status || "unknown";
+  return { description, code };
+}
+
 export default async function handler(req, res){
   setCors(res, req.headers.origin);
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -141,18 +150,28 @@ export default async function handler(req, res){
     try {
       pay = await mpPayment.create({ body });
     } catch (err) {
-      // Extrai mensagem detalhada da API do MP
-      const mpMsg =
-        (err?.response?.data && (err.response.data.message || err.response.data.error || err.response.data.cause?.[0]?.description)) ||
-        err?.message ||
-        "Erro ao criar pagamento no Mercado Pago";
-      // Atualiza fatura com erro
+      const { description, code } = unwrapMpError(err);
+
+      // Trata caso clássico de ambientes trocados
+      const isLiveCredsError =
+        /unauthorized use of live credentials/i.test(description) ||
+        /credenciais.*(produção|live)/i.test(description);
+
+      const hint = isLiveCredsError
+        ? "Ambientes trocados: use o Access Token das 'Credenciais de teste' no servidor e a Public Key da mesma seção no front. Em produção, troque ambos."
+        : null;
+
       await invRef.set({
         status: "erro",
-        gatewayError: mpMsg,
+        gatewayError: description,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
-      return res.status(500).json({ error: mpMsg });
+
+      return res.status(500).json({
+        error: description,
+        code,
+        hint
+      });
     }
 
     // Atualiza fatura
