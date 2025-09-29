@@ -1,1 +1,8 @@
+{
+  "version": 2,
+  "functions": { "api/**/*.js": { "runtime": "nodejs18.x" } },
+  "crons": [
+    { "path": "/api/cron/generate-invoices", "schedule": "0 6 * * *" }
+  ]
+}
 
