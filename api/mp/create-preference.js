@@ -5,7 +5,7 @@ const PLAN_MONTHS = { mensal: 1, trimestral: 3, semestral: 6 };
 const PLAN_LABEL  = { mensal: "Mensal", trimestral: "Trimestral", semestral: "Semestral" };
 const PLAN_PRICE  = { mensal: 30, trimestral: 85, semestral: 170 };
 
-// --- CORS dinâmico: permita produção e ambientes locais de teste ---
+// --- CORS dinâmico: permite produção e ambiente local de teste ---
 const ORIGINS = new Set([
   "https://clubedocavalobonfim.com.br",
   "http://127.0.0.1:5500",
@@ -14,11 +14,11 @@ const ORIGINS = new Set([
 ]);
 
 function setCors(res, origin) {
-  res.setHeader("Vary", "Origin"); // para caches/CDNs
+  res.setHeader("Vary", "Origin");
   if (origin && ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // fallback seguro: domínio de produção
+    // Fallback seguro: domínio de produção
     res.setHeader("Access-Control-Allow-Origin", "https://clubedocavalobonfim.com.br");
   }
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -33,11 +33,9 @@ function addMonthsSafe(d, m) {
 }
 
 export default async function handler(req, res) {
-  // CORS (produção + local)
+  // Libera CORS (produção + local) e responde preflight
   setCors(res, req.headers.origin);
-  if (req.method === "OPTIONS") {
-    return res.status(204).end(); // preflight OK
-  }
+  if (req.method === "OPTIONS") return res.status(204).end();
 
   try {
     if (req.method !== "POST") return res.status(405).end();
@@ -49,12 +47,12 @@ export default async function handler(req, res) {
 
     const amount = PLAN_PRICE[planType];
 
-    // ciclo atual
+    // Define ciclo do plano
     const start = new Date(); start.setHours(0, 0, 0, 0);
     const end = addMonthsSafe(start, PLAN_MONTHS[planType]);
     const due = end;
 
-    // cria fatura em_aberto
+    // Cria fatura "em_aberto"
     const invRef = await db.collection("users").doc(uid)
       .collection("financeInvoices").add({
         planType, planName: PLAN_LABEL[planType],
@@ -66,7 +64,7 @@ export default async function handler(req, res) {
         recordedAt: FieldValue.serverTimestamp()
       });
 
-    // preferência do Checkout Pro (SDK v2)
+    // Cria a preferência (Checkout Pro) — SDK v2
     const pref = await mpPreference.create({
       body: {
         items: [{
@@ -87,10 +85,15 @@ export default async function handler(req, res) {
       }
     });
 
-    const init_point = pref.init_point || pref.sandbox_init_point;
+    // ✅ Prioriza sandbox quando o token é de TESTE
+    const isTest = (process.env.MP_ACCESS_TOKEN || "").startsWith("TEST-");
+    const init_point = isTest
+      ? (pref.sandbox_init_point || pref.init_point)
+      : (pref.init_point || pref.sandbox_init_point);
+
     await invRef.update({ paymentUrl: init_point, preferenceId: pref.id });
 
-    // (opcional) já grava/atualiza summary com próximo vencimento
+    // (Opcional) já deixa o summary com próximo vencimento preparado
     // const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
     // await summaryRef.set({
     //   planType,
