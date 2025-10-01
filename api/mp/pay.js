@@ -21,7 +21,8 @@ function setCors(res, origin) {
     origin && ORIGINS.has(origin) ? origin : "https://clubedocavalobonfim.com.br"
   );
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // + Idempotency-Key para o MP SDK v2
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key");
 }
 
 // Add months preservando fim de mês
@@ -48,12 +49,18 @@ function isValidCPF(cpf) {
 }
 
 function unwrapMpError(err) {
-  // Tenta extrair mensagem/código padrão do MP
   const data = err?.response?.data || {};
-  const cause = Array.isArray(data?.cause) ? data.cause[0] : null;
-  const description = cause?.description || data?.message || data?.error || err?.message || "Erro ao criar pagamento no Mercado Pago";
+  // v2 costuma vir como { message, error, error_description, cause: [ { code, description } ] }
+  const cause = Array.isArray(data?.cause) && data.cause.length ? data.cause[0] : null;
+  const description =
+    cause?.description ||
+    data?.error_description ||
+    data?.message ||
+    data?.error ||
+    err?.message ||
+    "Erro ao criar pagamento no Mercado Pago";
   const code = cause?.code || data?.status || err?.response?.status || "unknown";
-  return { description, code };
+  return { description, code, raw: data };
 }
 
 export default async function handler(req, res){
@@ -67,8 +74,8 @@ export default async function handler(req, res){
   const isTestEnv = String(process.env.MP_ENV || "").toUpperCase() === "TEST" || isLocalOrigin;
 
   try {
-    const { uid, planType = "mensal", formData } = req.body || {};
-    if (!uid || !PLAN_MONTHS[planType] || !formData) {
+    const { uid, planType = "mensal", formData = {}, payer: payerTop = {} } = req.body || {};
+    if (!uid || !PLAN_MONTHS[planType]) {
       return res.status(400).json({ error: "Parâmetros inválidos" });
     }
 
@@ -89,36 +96,56 @@ export default async function handler(req, res){
         recordedAt: FieldValue.serverTimestamp()
       });
 
-    // Normaliza campos vindos do Brick
+    // Normaliza campos vindos do Brick (formData) e possíveis overrides do topo (payerTop)
     const {
       token,                       // só cartão
       payment_method_id,           // "visa" | "master" | "pix" | "bolbradesco"...
       payment_type_id,             // "credit_card" | "debit_card" | "bank_transfer" | "ticket"
       issuer_id,
       installments,
-      payer = {}
+      idempotencyKey               // opcional (front)
     } = formData;
 
-    const payerEmail = payer.email || formData.email || "comprador+teste@ccbmg.dev";
-    let payerIdType   = (payer.identification && payer.identification.type) || "CPF";
-    let payerIdNumber = (payer.identification && payer.identification.number) || "";
+    // Payer pode vir em formData.payer OU no topo (payerTop) com firstName/lastName
+    const payerForm = formData.payer || {};
+    const email = payerForm.email || payerTop.email || formData.email || "comprador+teste@ccbmg.dev";
+
+    // identification (CPF)
+    let idType   = (payerForm.identification?.type) || (payerTop.identification?.type) || "CPF";
+    let idNumber = (payerForm.identification?.number) || (payerTop.identification?.number) || "";
+
+    // nomes
+    const firstName =
+      payerForm.firstName || payerTop.firstName || payerForm.first_name || payerTop.first_name || undefined;
+    const lastName  =
+      payerForm.lastName  || payerTop.lastName  || payerForm.last_name  || payerTop.last_name  || undefined;
+    const fullName  = payerForm.name || payerTop.name || undefined;
 
     // Regras por tipo
     const isCard   = payment_type_id === "credit_card" || payment_type_id === "debit_card";
     const isPix    = payment_method_id === "pix" || payment_type_id === "pix" || payment_type_id === "bank_transfer";
-    const isBoleto = payment_type_id === "ticket";
+    const isBoleto = payment_type_id === "ticket" || payment_method_id === "bolbradesco";
 
     // CPF obrigatório para cartão e boleto
     if (isCard || isBoleto) {
-      if (!isValidCPF(payerIdNumber)) {
+      if (!isValidCPF(idNumber)) {
         if (isTestEnv) {
-          payerIdNumber = "19119119100"; // CPF de teste
-          payerIdType = "CPF";
+          idNumber = "19119119100"; // CPF de teste
+          idType = "CPF";
         } else {
           return res.status(400).json({ error: "CPF do pagador é obrigatório para cartão/boleto." });
         }
       }
     }
+
+    // Monta payer para o MP
+    const mpPayer = {
+      email,
+      identification: (isCard || isBoleto) ? { type: idType, number: String(idNumber) } : undefined,
+      // O SDK v2 aceita first_name/last_name; se só tivermos name, mandamos como first_name
+      first_name: firstName || fullName || "Cliente",
+      last_name:  lastName  || (fullName ? "" : "CCBMG")
+    };
 
     // Monta o pagamento conforme método
     const body = {
@@ -128,14 +155,9 @@ export default async function handler(req, res){
       installments: Number(installments || 1),
       external_reference: invRef.id,
       statement_descriptor: "CLUBE CAVALO",
-      binary_mode: true,                 // resposta imediata (bom para sandbox)
-      metadata: { uid, planType, invoiceId: invRef.id },
-      payer: {
-        email: payerEmail,
-        identification: (isCard || isBoleto) ? { type: payerIdType, number: String(payerIdNumber) } : undefined,
-        first_name: payer.first_name || "Cliente",
-        last_name:  payer.last_name  || "CCBMG"
-      }
+      binary_mode: true,
+      metadata: { uid, planType, invoiceId: invRef.id, source: "brick" },
+      payer: mpPayer
     };
 
     if (isCard) {
@@ -145,27 +167,38 @@ export default async function handler(req, res){
     }
     // PIX não precisa de token
 
-    // Tenta criar pagamento
+    // Idempotência (gera se não veio do front)
+    const idem = idempotencyKey || `ikey-${uid}-${Date.now()}`;
+
+    // Chamada ao MP
     let pay;
     try {
-      pay = await mpPayment.create({ body });
+      pay = await mpPayment.create({
+        body,
+        requestOptions: { idempotencyKey: idem }
+      });
     } catch (err) {
-      const { description, code } = unwrapMpError(err);
+      const { description, code, raw } = unwrapMpError(err);
 
-      // Trata caso clássico de ambientes trocados
+      // Casos comuns de 401/UNAUTHORIZED por política:
       const isLiveCredsError =
         /unauthorized use of live credentials/i.test(description) ||
-        /credenciais.*(produção|live)/i.test(description);
+        /credenciais.*(produção|live)/i.test(description) ||
+        /At least one policy returned UNAUTHORIZED/i.test(description);
 
       const hint = isLiveCredsError
-        ? "Ambientes trocados: use o Access Token das 'Credenciais de teste' no servidor e a Public Key da mesma seção no front. Em produção, troque ambos."
+        ? "Ambientes trocados ou app diferente: Access Token do servidor e Public Key do front devem ser da MESMA aba (Credenciais de teste) do MESMO aplicativo. Cartão de teste não funciona com credenciais de produção."
         : null;
 
       await invRef.set({
         status: "erro",
         gatewayError: description,
+        gatewayCode: code,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
+
+      // Log útil para diagnóstico (apenas no server)
+      console.error("MP create payment error:", { description, code, raw });
 
       return res.status(500).json({
         error: description,
