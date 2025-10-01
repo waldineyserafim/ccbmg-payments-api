@@ -252,22 +252,30 @@ export default async function handler(req, res){
       updatedAt: FieldValue.serverTimestamp()
     }, { merge:true });
 
-    // Próxima ação para PIX/BOLETO
+    // Próxima ação para PIX/BOLETO (retorna códigos copiáveis)
     let next_action = null;
     if (pay.status === "pending") {
       if (isPix) {
         const td = pay.point_of_interaction?.transaction_data;
         next_action = {
           type: "pix",
-          qr: td?.qr_code,
-          qr_base64: td?.qr_code_base64,
+          copy_and_paste: td?.qr_code || null,        // código PIX
+          qr_base64: td?.qr_code_base64 || null,      // QR em base64
           link: td?.ticket_url || td?.external_resource_url || null
         };
       } else if (isBoleto) {
-        const link = pay.transaction_details?.external_resource_url
-          || pay.point_of_interaction?.transaction_data?.ticket_url
-          || null;
-        next_action = { type: "boleto", link };
+        const td = pay.transaction_details || {};
+        const poi = pay.point_of_interaction?.transaction_data || {};
+        const barcode =
+          td?.barcode ||
+          td?.barcode_content ||
+          poi?.barcode ||
+          poi?.qr_code ||   // alguns emissores entregam aqui
+          null;
+
+        const link = td?.external_resource_url || poi?.ticket_url || null;
+
+        next_action = { type: "boleto", barcode, link };
       }
     }
 
