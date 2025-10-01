@@ -170,42 +170,40 @@ export default async function handler(req, res){
     // Idempotência (gera se não veio do front)
     const idem = idempotencyKey || `ikey-${uid}-${Date.now()}`;
 
-    // Chamada ao MP
+    // Tenta criar pagamento
     let pay;
     try {
+      const idem = formData?.idempotencyKey || `ikey-${uid}-${Date.now()}`;
       pay = await mpPayment.create({
         body,
         requestOptions: { idempotencyKey: idem }
       });
     } catch (err) {
-      const { description, code, raw } = unwrapMpError(err);
-
-      // Casos comuns de 401/UNAUTHORIZED por política:
-      const isLiveCredsError =
-        /unauthorized use of live credentials/i.test(description) ||
-        /credenciais.*(produção|live)/i.test(description) ||
-        /At least one policy returned UNAUTHORIZED/i.test(description);
-
-      const hint = isLiveCredsError
-        ? "Ambientes trocados ou app diferente: Access Token do servidor e Public Key do front devem ser da MESMA aba (Credenciais de teste) do MESMO aplicativo. Cartão de teste não funciona com credenciais de produção."
-        : null;
-
+      const data = err?.response?.data || {};
+      const description =
+        data?.error_description ||
+        data?.message ||
+        (Array.isArray(data?.cause) && data.cause.length ? data.cause[0].description : null) ||
+        err?.message ||
+        "Erro ao criar pagamento no Mercado Pago";
+    
+      const isPolicy = /policy .*unauthorized|At least one policy returned UNAUTHORIZED/i.test(description);
+    
       await invRef.set({
         status: "erro",
         gatewayError: description,
-        gatewayCode: code,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
-
-      // Log útil para diagnóstico (apenas no server)
-      console.error("MP create payment error:", { description, code, raw });
-
+    
       return res.status(500).json({
         error: description,
-        code,
-        hint
+        code: data?.status || "unknown",
+        hint: isPolicy
+          ? "Ambientes trocados ou app diferente: Access Token do servidor e Public Key do front DEVEM ser da mesma 'Credenciais de teste' do MESMO app."
+          : null
       });
     }
+
 
     // Atualiza fatura
     const approved = pay.status === "approved";
