@@ -50,7 +50,6 @@ function isValidCPF(cpf) {
 
 function unwrapMpError(err) {
   const data = err?.response?.data || {};
-  // v2 costuma vir como { message, error, error_description, cause: [ { code, description } ] }
   const cause = Array.isArray(data?.cause) && data.cause.length ? data.cause[0] : null;
   const description =
     cause?.description ||
@@ -62,6 +61,10 @@ function unwrapMpError(err) {
   const code = cause?.code || data?.status || err?.response?.status || "unknown";
   return { description, code, raw: data };
 }
+
+// e-mail sintético quando necessário
+const VALID_EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const synthEmail = (uid) => `noreply+${uid}@ccbmg.dev`;
 
 export default async function handler(req, res){
   setCors(res, req.headers.origin);
@@ -106,9 +109,9 @@ export default async function handler(req, res){
       idempotencyKey               // opcional (front)
     } = formData;
 
-    // Payer pode vir em formData.payer OU no topo (payerTop) com firstName/lastName
+    // Payer pode vir em formData.payer OU no topo (payerTop)
     const payerForm = formData.payer || {};
-    const email = payerForm.email || payerTop.email || formData.email || "comprador+teste@ccbmg.dev";
+    let email = (payerForm.email || payerTop.email || formData.email || "").trim();
 
     // identification (CPF)
     let idType   = (payerForm.identification?.type) || (payerTop.identification?.type) || "CPF";
@@ -138,9 +141,18 @@ export default async function handler(req, res){
       }
     }
 
+    // e-mail:
+    // - PIX: não envia
+    // - Cartão/Boleto: se não vier válido, gera sintético
+    if (!isPix) {
+      if (!VALID_EMAIL.test(email)) {
+        email = synthEmail(uid);
+      }
+    }
+
     // Monta payer para o MP
     const mpPayer = {
-      email,
+      ...(isPix ? {} : { email }), // não manda email no PIX
       identification: (isCard || isBoleto) ? { type: idType, number: String(idNumber) } : undefined,
       // O SDK v2 aceita first_name/last_name; se só tivermos name, mandamos como first_name
       first_name: firstName || fullName || "Cliente",
@@ -173,7 +185,6 @@ export default async function handler(req, res){
     // Tenta criar pagamento
     let pay;
     try {
-      const idem = formData?.idempotencyKey || `ikey-${uid}-${Date.now()}`;
       pay = await mpPayment.create({
         body,
         requestOptions: { idempotencyKey: idem }
@@ -186,15 +197,15 @@ export default async function handler(req, res){
         (Array.isArray(data?.cause) && data.cause.length ? data.cause[0].description : null) ||
         err?.message ||
         "Erro ao criar pagamento no Mercado Pago";
-    
+
       const isPolicy = /policy .*unauthorized|At least one policy returned UNAUTHORIZED/i.test(description);
-    
+
       await invRef.set({
         status: "erro",
         gatewayError: description,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
-    
+
       return res.status(500).json({
         error: description,
         code: data?.status || "unknown",
@@ -203,7 +214,6 @@ export default async function handler(req, res){
           : null
       });
     }
-
 
     // Atualiza fatura
     const approved = pay.status === "approved";
