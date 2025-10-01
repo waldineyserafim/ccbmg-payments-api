@@ -62,8 +62,13 @@ function unwrapMpError(err) {
 }
 
 // e-mail sintético quando necessário
-const VALID_EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
-const synthEmail = (uid) => `noreply+${uid}@ccbmg.dev`;
+const VALID_EMAIL = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
+// gera um e-mail curto, alfanumérico, sem "+" (algumas contas do MP rejeitam "+")
+function synthEmail(uid = "user") {
+  const clean = String(uid).replace(/[^A-Za-z0-9]/g, "").slice(0, 20) || "user";
+  return `noreply-${clean}@ccbmg.dev`;
+}
 
 export default async function handler(req, res){
   setCors(res, req.headers.origin);
@@ -147,18 +152,22 @@ export default async function handler(req, res){
       }
     }
 
-    // e-mail:
-    // - PIX: não envia
-    // - Cartão/Boleto: se não vier válido, gera sintético
+    // E-mail:
+    // - PIX: não envia (o MP não exige)
+    // - Cartão/Boleto: se vier vazio/ruim, gera um sintético alfanumérico curto
     if (!isPix) {
       if (!VALID_EMAIL.test(email)) {
         email = synthEmail(uid);
+      }
+      // safety extra: se por algum motivo ainda estiver inválido, força um fallback curtinho
+      if (!VALID_EMAIL.test(email)) {
+        email = "noreply@ccbmg.dev";
       }
     }
 
     // Monta payer para o MP
     const mpPayer = {
-      ...(isPix ? {} : { email }), // não manda email no PIX
+      ...(isPix ? {} : { email }),     // NÃO manda email no PIX
       identification: (isCard || isBoleto) ? { type: idType, number: String(idNumber) } : undefined,
       first_name: firstName || fullName || "Cliente",
       last_name:  lastName  || (fullName ? "" : "CCBMG")
