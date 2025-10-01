@@ -61,7 +61,7 @@ function unwrapMpError(err) {
   return { description, code, raw: data };
 }
 
-// SEMPRE usar e-mail sintético para cartão/boleto (evita formatos inválidos vindos do Brick)
+// SEMPRE usar e-mail sintético para satisfazer validações do MP (sem pedir ao usuário)
 function synthEmail(uid = "user") {
   const clean = String(uid).replace(/[^A-Za-z0-9]/g, "").slice(0, 20) || "user";
   return `user-${clean}@example.com`; // domínio reservado para testes
@@ -148,12 +148,12 @@ export default async function handler(req, res){
     }
 
     // ===== Regras de payer/email por método =====
-    // - PIX: MP exige que "payer" exista → enviaremos o mínimo possível, sem email.
+    // - PIX: o MP exige que "payer" exista → enviamos obj mínimo + e-mail sintético gerado no backend (não aparece no front).
     // - Cartão/Boleto: ignoramos e-mails do front e sempre usamos um sintético válido.
-    const emailToSend = (isCard || isBoleto) ? synthEmail(uid) : null;
+    const emailToSend = (isCard || isBoleto || isPix) ? synthEmail(uid) : null;
 
     const mpPayer = isPix
-      ? { entity_type: "individual" } // mínimo para não cair em 'payer_cannot_be_nil'
+      ? { entity_type: "individual", email: emailToSend } // evita 'payer_cannot_be_nil'
       : {
           email: emailToSend,
           identification: (isCard || isBoleto) ? { type: idType, number: String(idNumber) } : undefined,
@@ -203,7 +203,6 @@ export default async function handler(req, res){
 
       // Info de ambiente/token para ajudar a diagnosticar "Unauthorized use of live credentials"
       const tokenPrefix = String(process.env.MP_ACCESS_TOKEN || "").slice(0, 12);
-      const tokenLooksProd = /^APP_USR-/.test(String(process.env.MP_ACCESS_TOKEN || "")) && !isTestEnv; // heurística
 
       return res.status(500).json({
         error: description,
@@ -264,7 +263,7 @@ export default async function handler(req, res){
           td?.barcode ||
           td?.barcode_content ||
           poi?.barcode ||
-          poi?.qr_code ||   // alguns emissores entregam aqui
+          poi?.qr_code ||
           null;
 
         const link = td?.external_resource_url || poi?.ticket_url || null;
