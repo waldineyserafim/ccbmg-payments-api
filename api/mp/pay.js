@@ -61,13 +61,12 @@ function unwrapMpError(err) {
   return { description, code, raw: data };
 }
 
-// e-mail sintético quando necessário
+// ===== E-mail sintético quando necessário =====
 const VALID_EMAIL = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
-
-// gera um e-mail curto, alfanumérico, sem "+" (algumas contas do MP rejeitam "+")
+// usa domínio reservado (sempre aceito) e só alfanumérico
 function synthEmail(uid = "user") {
   const clean = String(uid).replace(/[^A-Za-z0-9]/g, "").slice(0, 20) || "user";
-  return `noreply-${clean}@ccbmg.dev`;
+  return `user-${clean}@example.com`;
 }
 
 export default async function handler(req, res){
@@ -103,7 +102,7 @@ export default async function handler(req, res){
       });
 
     // ===== Normaliza campos do Brick (suporta snake_case e camelCase)
-    const token            = formData.token;
+    const token             = formData.token;
     const payment_method_id = formData.payment_method_id || formData.paymentMethodId || formData.payment_method || formData.paymentMethod;
     const payment_type_id   = formData.payment_type_id   || formData.paymentTypeId;
     const issuer_id         = formData.issuer_id         || formData.issuerId;
@@ -152,16 +151,17 @@ export default async function handler(req, res){
       }
     }
 
-    // E-mail:
-    // - PIX: não envia (o MP não exige)
-    // - Cartão/Boleto: se vier vazio/ruim, gera um sintético alfanumérico curto
-    if (!isPix) {
+    // ===== Regras de e-mail =====
+    // PIX: não enviar e-mail
+    // Cartão/Boleto: obrigatório. Se vier vazio/ruim, gera um sintético infalível.
+    if (isPix) {
+      email = ""; // garantimos que não será enviado
+    } else if (isCard || isBoleto) {
       if (!VALID_EMAIL.test(email)) {
-        email = synthEmail(uid);
+        email = synthEmail(uid); // ex.: user-abc123@example.com
       }
-      // safety extra: se por algum motivo ainda estiver inválido, força um fallback curtinho
       if (!VALID_EMAIL.test(email)) {
-        email = "noreply@ccbmg.dev";
+        email = "user@example.com"; // fallback final
       }
     }
 
@@ -213,14 +213,19 @@ export default async function handler(req, res){
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
 
-      // Em teste, devolve detalhes para facilitar o debug no front
       return res.status(500).json({
         error: description,
         code: raw?.status || code || "unknown",
         hint: isPolicy
           ? "Ambientes trocados ou app diferente: Access Token do servidor e Public Key do front DEVEM ser da mesma 'Credenciais de teste' do MESMO app."
           : null,
-        debug: isTestEnv ? { payment_method_id, payment_type_id, hasToken: !!token } : undefined
+        debug: isTestEnv ? {
+          method: isPix ? "pix" : (isCard ? "card" : (isBoleto ? "boleto" : "other")),
+          sentEmail: isPix ? "(omitted)" : email,
+          payment_method_id,
+          payment_type_id,
+          hasToken: !!token
+        } : undefined
       });
     }
 
