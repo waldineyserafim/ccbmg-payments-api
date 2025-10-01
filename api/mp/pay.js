@@ -21,7 +21,6 @@ function setCors(res, origin) {
     origin && ORIGINS.has(origin) ? origin : "https://clubedocavalobonfim.com.br"
   );
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  // + Idempotency-Key para o MP SDK v2
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key");
 }
 
@@ -71,7 +70,6 @@ export default async function handler(req, res){
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST")   return res.status(405).end();
 
-  // Ambiente de TESTE: definido por MP_ENV=TEST ou origem local (localhost/127.*)
   const origin = req.headers.origin || "";
   const isLocalOrigin = /localhost|127\.0\.0\.1/.test(origin);
   const isTestEnv = String(process.env.MP_ENV || "").toUpperCase() === "TEST" || isLocalOrigin;
@@ -99,17 +97,15 @@ export default async function handler(req, res){
         recordedAt: FieldValue.serverTimestamp()
       });
 
-    // Normaliza campos vindos do Brick (formData) e possíveis overrides do topo (payerTop)
-    const {
-      token,                       // só cartão
-      payment_method_id,           // "visa" | "master" | "pix" | "bolbradesco"...
-      payment_type_id,             // "credit_card" | "debit_card" | "bank_transfer" | "ticket"
-      issuer_id,
-      installments,
-      idempotencyKey               // opcional (front)
-    } = formData;
+    // ===== Normaliza campos do Brick (suporta snake_case e camelCase)
+    const token            = formData.token;
+    const payment_method_id = formData.payment_method_id || formData.paymentMethodId || formData.payment_method || formData.paymentMethod;
+    const payment_type_id   = formData.payment_type_id   || formData.paymentTypeId;
+    const issuer_id         = formData.issuer_id         || formData.issuerId;
+    const installments      = formData.installments;
+    const idempotencyKey    = formData.idempotencyKey;
 
-    // Payer pode vir em formData.payer OU no topo (payerTop)
+    // payer pode vir no formData/payer ou no topo
     const payerForm = formData.payer || {};
     let email = (payerForm.email || payerTop.email || formData.email || "").trim();
 
@@ -125,9 +121,19 @@ export default async function handler(req, res){
     const fullName  = payerForm.name || payerTop.name || undefined;
 
     // Regras por tipo
-    const isCard   = payment_type_id === "credit_card" || payment_type_id === "debit_card";
+    const isCard   = payment_type_id === "credit_card" || payment_type_id === "debit_card" || (!payment_type_id && token); // fallback
     const isPix    = payment_method_id === "pix" || payment_type_id === "pix" || payment_type_id === "bank_transfer";
     const isBoleto = payment_type_id === "ticket" || payment_method_id === "bolbradesco";
+
+    // Validações específicas do Cartão
+    if (isCard) {
+      if (!token) {
+        return res.status(400).json({ error: "Token do cartão ausente (formData.token)." });
+      }
+      if (!payment_method_id) {
+        return res.status(400).json({ error: "payment_method_id ausente (ex.: 'visa', 'master')." });
+      }
+    }
 
     // CPF obrigatório para cartão e boleto
     if (isCard || isBoleto) {
@@ -154,7 +160,6 @@ export default async function handler(req, res){
     const mpPayer = {
       ...(isPix ? {} : { email }), // não manda email no PIX
       identification: (isCard || isBoleto) ? { type: idType, number: String(idNumber) } : undefined,
-      // O SDK v2 aceita first_name/last_name; se só tivermos name, mandamos como first_name
       first_name: firstName || fullName || "Cliente",
       last_name:  lastName  || (fullName ? "" : "CCBMG")
     };
@@ -173,7 +178,6 @@ export default async function handler(req, res){
     };
 
     if (isCard) {
-      if (!token)   return res.status(400).json({ error: "Token do cartão ausente." });
       body.token = token;
       if (issuer_id) body.issuer_id = issuer_id;
     }
@@ -190,28 +194,24 @@ export default async function handler(req, res){
         requestOptions: { idempotencyKey: idem }
       });
     } catch (err) {
-      const data = err?.response?.data || {};
-      const description =
-        data?.error_description ||
-        data?.message ||
-        (Array.isArray(data?.cause) && data.cause.length ? data.cause[0].description : null) ||
-        err?.message ||
-        "Erro ao criar pagamento no Mercado Pago";
+      const { description, code, raw } = unwrapMpError(err);
 
       const isPolicy = /policy .*unauthorized|At least one policy returned UNAUTHORIZED/i.test(description);
-
       await invRef.set({
         status: "erro",
         gatewayError: description,
+        gatewayCode: code,
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
 
+      // Em teste, devolve detalhes para facilitar o debug no front
       return res.status(500).json({
         error: description,
-        code: data?.status || "unknown",
+        code: raw?.status || code || "unknown",
         hint: isPolicy
           ? "Ambientes trocados ou app diferente: Access Token do servidor e Public Key do front DEVEM ser da mesma 'Credenciais de teste' do MESMO app."
-          : null
+          : null,
+        debug: isTestEnv ? { payment_method_id, payment_type_id, hasToken: !!token } : undefined
       });
     }
 
