@@ -1,6 +1,6 @@
 // api/mp/webhook.js
 import fetch from "node-fetch";
-import { db, Timestamp } from "../_firebase.js";
+import { db, Timestamp, FieldValue } from "../_firebase.js";
 
 // (opcional) verificação de assinatura — pode simplificar se não estiver usando a V2 com secret
 function isFromMP(req) {
@@ -10,7 +10,7 @@ function isFromMP(req) {
 }
 
 const accessToken =
-  process.env.MP_ENV === "live"
+  (process.env.MP_ENV || "").toLowerCase() === "live"
     ? process.env.MP_ACCESS_TOKEN_LIVE
     : process.env.MP_ACCESS_TOKEN_TEST;
 
@@ -25,7 +25,10 @@ export default async function handler(req, res) {
     let paymentId = null;
 
     if (topic.includes("payment")) {
-      paymentId = body.data?.id || body.id || body.resource?.split("/").pop();
+      paymentId =
+        body?.data?.id ||
+        body?.id ||
+        (typeof body.resource === "string" ? body.resource.split("/").pop() : null);
     }
 
     if (!paymentId) {
@@ -38,63 +41,72 @@ export default async function handler(req, res) {
     });
     const pay = await payRes.json();
 
-    if (String(pay.status).toLowerCase() !== "approved") {
+    if (String(pay.status || "").toLowerCase() !== "approved") {
       // ignorar pagamentos não aprovados
       return res.status(200).send("ignored");
     }
 
-    // Recupera o external_reference com uid + invoiceId
-    let ref = {};
-    try { ref = JSON.parse(pay.external_reference || "{}"); } catch {}
-    const uid = ref.uid;
-    const invoiceId = ref.invoiceId;
+    // >>> Pegamos uid do metadata; invoiceId do external_reference (ID "cru" da fatura)
+    const metadata = pay?.metadata || {};
+    const uid = metadata.uid || metadata.userId || metadata.user_id || null;
+
+    let invoiceId = null;
+    const ext = pay?.external_reference;
+    if (typeof ext === "string") {
+      invoiceId = ext; // seu pay.js envia o ID puro da fatura aqui
+      // se alguém mudar para JSON no futuro, tenta extrair
+      if (/^\s*{/.test(ext)) {
+        try { invoiceId = JSON.parse(ext)?.invoiceId || invoiceId; } catch {}
+      }
+    } else if (ext && typeof ext === "object") {
+      invoiceId = ext.invoiceId || null;
+    }
 
     if (!uid || !invoiceId) {
-      console.warn("Webhook: external_reference sem uid/invoiceId", pay.external_reference);
+      console.warn("Webhook: approved, mas sem uid/invoiceId", { uid, invoiceId, ext, metadata });
       return res.status(200).send("no-ref");
     }
 
-    // ===== Cálculos de vigência do plano =====
-    // months pode estar na fatura; busque-a:
-    const invRef = db.collection("users").doc(uid).collection("invoices").doc(invoiceId);
+    // >>> Coleção correta: financeInvoices (alinhado ao pay.js)
+    const invRef = db.collection("users").doc(uid).collection("financeInvoices").doc(invoiceId);
     const invSnap = await invRef.get();
     const inv = invSnap.exists ? invSnap.data() : {};
-    const months = Number(inv.months || 1);
 
-    const paidAt = Timestamp.now();
-    // planEnd = hoje + months (ajuste se você usa outra regra)
-    const planEndDate = new Date();
-    planEndDate.setMonth(planEndDate.getMonth() + months);
-    const planEnd = Timestamp.fromDate(planEndDate);
+    // Prefira planEnd já salvo na fatura; use paidAt do MP se existir
+    const paidAt = pay.date_approved ? Timestamp.fromDate(new Date(pay.date_approved)) : Timestamp.now();
+    const planEnd = inv?.planEnd || null;
+    const amount = inv?.amount ?? pay?.transaction_amount ?? 0;
 
     // ===== Atualiza a fatura =====
     await invRef.set(
       {
         status: "pago",
         paidAt,
+        method: "MercadoPago",
+        gatewayId: String(pay.id),
+        updatedAt: FieldValue.serverTimestamp(),
         mp: {
           ...(inv.mp || {}),
           paymentId: pay.id,
           status: pay.status,
           status_detail: pay.status_detail,
-          payer: { id: pay.payer?.id || null, email: pay.payer?.email || null },
-        },
-        planEnd,
+          payer: { id: pay?.payer?.id || null, email: pay?.payer?.email || null },
+        }
       },
       { merge: true }
     );
 
-    // ===== Atualiza summary (zera pendência) =====
+    // ===== Atualiza summary (zera pendência e marca vigência) =====
     const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
     await summaryRef.set(
       {
         lastPayment: paidAt,
-        lastAmount: Number(inv.amount || pay.transaction_amount || 0),
-        activeUntil: planEnd,
-        nextDue: planEnd,          // você pode usar a mesma data; alguns preferem +1 dia
-        balance: 0,                // MUITO IMPORTANTE para getUserStatus()
-        updatedAt: Timestamp.now(),
+        lastAmount: Number(amount || 0),
+        activeUntil: planEnd || null,
+        nextDue: planEnd || null, // pode usar a mesma data; ajuste se preferir +1 dia
+        balance: 0,               // MUITO IMPORTANTE para getUserStatus()
         exempt: false,
+        updatedAt: FieldValue.serverTimestamp()
       },
       { merge: true }
     );
@@ -104,9 +116,9 @@ export default async function handler(req, res) {
     await userRef.set(
       {
         ativo: true,
-        // coloque um texto que NÃO contenha "pend"
+        // texto sem "pend" para não conflitar com seu getUserStatus()
         status: "Em dia",
-        updatedAt: Timestamp.now(),
+        updatedAt: FieldValue.serverTimestamp()
       },
       { merge: true }
     );
