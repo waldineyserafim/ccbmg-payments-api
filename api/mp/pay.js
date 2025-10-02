@@ -78,18 +78,31 @@ export default async function handler(req, res){
   const isTestEnv = String(process.env.MP_ENV || "").toUpperCase() === "TEST" || isLocalOrigin;
 
   try {
-    const { uid, planType = "mensal", formData = {}, payer: payerTop = {} } = req.body || {};
+    const {
+      uid,
+      planType = "mensal",
+      formData = {},
+      payer: payerTop = {},
+      invoiceId: invoiceIdFromClient // <- NOVO: aceita invoiceId vindo do front
+    } = req.body || {};
+
     if (!uid || !PLAN_MONTHS[planType]) {
       return res.status(400).json({ error: "Parâmetros inválidos" });
     }
 
     const amount = Number(PLAN_PRICE[planType]);
 
-    // Cria fatura "em_aberto"
-    const start = new Date(); start.setHours(0,0,0,0);
-    const end   = addMonthsSafe(start, PLAN_MONTHS[planType]);
-    const invRef = await db.collection("users").doc(uid)
-      .collection("financeInvoices").add({
+    // ====== Invoice: usa a do front se veio; senão cria como antes em financeInvoices
+    let invDocRef;
+    let invId = invoiceIdFromClient || null;
+
+    if (invId) {
+      // Usa o ID informado para manter o vínculo exato front<->webhook
+      invDocRef = db.collection("users").doc(uid).collection("financeInvoices").doc(invId);
+      const start = new Date(); start.setHours(0,0,0,0);
+      const end   = addMonthsSafe(start, PLAN_MONTHS[planType]);
+
+      await invDocRef.set({
         planType,
         planName: PLAN_LABEL[planType],
         planStart: Timestamp.fromDate(start),
@@ -98,9 +111,26 @@ export default async function handler(req, res){
         amount,
         status: "em_aberto",
         recordedAt: FieldValue.serverTimestamp(),
-        // (opcional) guarda quantos meses para auditoria
         months: PLAN_MONTHS[planType]
-      });
+      }, { merge: true });
+    } else {
+      // Sem invoiceId do front: cria como já fazia
+      const start = new Date(); start.setHours(0,0,0,0);
+      const end   = addMonthsSafe(start, PLAN_MONTHS[planType]);
+      invDocRef = await db.collection("users").doc(uid)
+        .collection("financeInvoices").add({
+          planType,
+          planName: PLAN_LABEL[planType],
+          planStart: Timestamp.fromDate(start),
+          planEnd:   Timestamp.fromDate(end),
+          dueDate:   Timestamp.fromDate(end),
+          amount,
+          status: "em_aberto",
+          recordedAt: FieldValue.serverTimestamp(),
+          months: PLAN_MONTHS[planType]
+        });
+      invId = invDocRef.id;
+    }
 
     // ===== Normaliza campos do Brick (suporta snake_case e camelCase)
     const token             = formData.token;
@@ -150,12 +180,12 @@ export default async function handler(req, res){
     }
 
     // ===== Regras de payer/email por método =====
-    // - PIX: o MP exige que "payer" exista → enviamos obj mínimo + e-mail sintético gerado no backend (não aparece no front).
-    // - Cartão/Boleto: ignoramos e-mails do front e sempre usamos um sintético válido.
+    // - PIX: o MP exige que "payer" exista → enviamos obj mínimo + e-mail sintético
+    // - Cartão/Boleto: sempre usamos e-mail sintético (evita rejeição por e-mail faltante)
     const emailToSend = (isCard || isBoleto || isPix) ? synthEmail(uid) : null;
 
     const mpPayer = isPix
-      ? { entity_type: "individual", email: emailToSend } // evita 'payer_cannot_be_nil'
+      ? { entity_type: "individual", email: emailToSend }
       : {
           email: emailToSend,
           identification: (isCard || isBoleto) ? { type: idType, number: String(idNumber) } : undefined,
@@ -163,16 +193,19 @@ export default async function handler(req, res){
           last_name:  lastName  || (fullName ? "" : "CCBMG")
         };
 
+    // (NOVO) external_reference: preferir uid|invoiceId quando temos invoice do front/servidor
+    const externalRef = invId ? `${uid}|${invId}` : (invDocRef?.id || undefined);
+
     // Monta o pagamento conforme método
     const body = {
       transaction_amount: amount,
       description: `Associação ${PLAN_LABEL[planType]}`,
       payment_method_id,                 // "master" | "pix" | "bolbradesco" ...
       installments: Number(installments || 1),
-      external_reference: invRef.id,
+      external_reference: externalRef,
       statement_descriptor: "CLUBE CAVALO",
       binary_mode: true,
-      metadata: { uid, planType, invoiceId: invRef.id, source: "brick" },
+      metadata: { uid, planType, invoiceId: invId, source: "brick" },
       payer: mpPayer
     };
 
@@ -196,7 +229,7 @@ export default async function handler(req, res){
       const { description, code, raw } = unwrapMpError(err);
 
       const isPolicy = /policy .*unauthorized|At least one policy returned UNAUTHORIZED/i.test(description);
-      await invRef.set({
+      await invDocRef.set({
         status: "erro",
         gatewayError: description,
         gatewayCode: code,
@@ -235,10 +268,12 @@ export default async function handler(req, res){
     if (approved && pay.date_approved) {
       patch.paidAt = Timestamp.fromDate(new Date(pay.date_approved));
     }
-    await invRef.set(patch, { merge:true });
+    await invDocRef.set(patch, { merge:true });
 
     // ===== Atualiza summary (próximo vencimento)
-    // >>> ADIÇÃO: balance=0 e activeUntil=end quando aprovado (fecha o ciclo para liberar acesso)
+    const start = new Date(); start.setHours(0,0,0,0);
+    const end   = addMonthsSafe(start, PLAN_MONTHS[planType]);
+
     const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
     await summaryRef.set({
       planType,
@@ -249,7 +284,7 @@ export default async function handler(req, res){
       ...(approved ? { balance: 0, activeUntil: Timestamp.fromDate(end), exempt: false } : {})
     }, { merge:true });
 
-    // >>> ADIÇÃO: se aprovado, garante perfil ativo e status "Em dia"
+    // Se aprovado, garante perfil ativo e status "Em dia"
     if (approved) {
       const userRef = db.collection("users").doc(uid);
       await userRef.set({
@@ -290,7 +325,7 @@ export default async function handler(req, res){
       id: pay.id,
       status: pay.status,
       status_detail: pay.status_detail,
-      invoice_id: invRef.id,
+      invoice_id: invId,
       next_action
     });
   } catch (e) {

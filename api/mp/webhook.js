@@ -41,89 +41,135 @@ export default async function handler(req, res) {
     });
     const pay = await payRes.json();
 
-    if (String(pay.status || "").toLowerCase() !== "approved") {
-      // ignorar pagamentos não aprovados
-      return res.status(200).send("ignored");
-    }
+    const status = String(pay.status || "").toLowerCase();
+    const detail = String(pay.status_detail || "").toLowerCase();
 
-    // >>> Pegamos uid do metadata; invoiceId do external_reference (ID "cru" da fatura)
+    // === Estados úteis ===
+    const isApproved = status === "approved" || detail === "accredited"; // boleto compensado
+    const isExpiredOrCancelled =
+      status === "cancelled" || /expired|rejected/.test(detail);
+
+    // >>> Referências: preferimos external_reference "uid|invoiceId"
     const metadata = pay?.metadata || {};
-    const uid = metadata.uid || metadata.userId || metadata.user_id || null;
-
+    let uid = metadata.uid || metadata.userId || metadata.user_id || null;
     let invoiceId = null;
+
     const ext = pay?.external_reference;
     if (typeof ext === "string") {
-      invoiceId = ext; // seu pay.js envia o ID puro da fatura aqui
+      // formatos aceitos:
+      // - "uid|invoiceId" (preferido)
+      // - "invoiceId" (legado)
+      if (ext.includes("|")) {
+        const [maybeUid, maybeInvoice] = ext.split("|");
+        if (maybeUid && maybeInvoice) {
+          uid = uid || maybeUid;
+          invoiceId = maybeInvoice;
+        }
+      } else {
+        // legado: external_reference somente com o id da fatura
+        invoiceId = ext;
+      }
+
       // se alguém mudar para JSON no futuro, tenta extrair
       if (/^\s*{/.test(ext)) {
-        try { invoiceId = JSON.parse(ext)?.invoiceId || invoiceId; } catch {}
+        try {
+          const j = JSON.parse(ext);
+          uid = uid || j.uid || j.userId || j.user_id || uid;
+          invoiceId = j.invoiceId || invoiceId;
+        } catch {}
       }
     } else if (ext && typeof ext === "object") {
-      invoiceId = ext.invoiceId || null;
+      uid = uid || ext.uid || ext.userId || ext.user_id || uid;
+      invoiceId = ext.invoiceId || invoiceId;
     }
 
     if (!uid || !invoiceId) {
-      console.warn("Webhook: approved, mas sem uid/invoiceId", { uid, invoiceId, ext, metadata });
+      console.warn("Webhook: sem uid/invoiceId utilizáveis", { uid, invoiceId, ext, metadata, paymentId });
       return res.status(200).send("no-ref");
     }
 
-    // >>> Coleção correta: financeInvoices (alinhado ao pay.js)
+    // Caminho da fatura (alinhado ao pay.js)
     const invRef = db.collection("users").doc(uid).collection("financeInvoices").doc(invoiceId);
     const invSnap = await invRef.get();
     const inv = invSnap.exists ? invSnap.data() : {};
 
-    // Prefira planEnd já salvo na fatura; use paidAt do MP se existir
+    // Utilitários de datas já salvos na fatura (preferência ao que veio da invoice)
     const paidAt = pay.date_approved ? Timestamp.fromDate(new Date(pay.date_approved)) : Timestamp.now();
     const planEnd = inv?.planEnd || null;
     const amount = inv?.amount ?? pay?.transaction_amount ?? 0;
 
-    // ===== Atualiza a fatura =====
-    await invRef.set(
-      {
-        status: "pago",
-        paidAt,
-        method: "MercadoPago",
-        gatewayId: String(pay.id),
-        updatedAt: FieldValue.serverTimestamp(),
-        mp: {
-          ...(inv.mp || {}),
-          paymentId: pay.id,
-          status: pay.status,
-          status_detail: pay.status_detail,
-          payer: { id: pay?.payer?.id || null, email: pay?.payer?.email || null },
-        }
-      },
-      { merge: true }
-    );
+    // === Atualizações por estado ===
+    if (isApproved) {
+      // Fatura aprovada
+      await invRef.set(
+        {
+          status: "pago",
+          paidAt,
+          method: "MercadoPago",
+          gatewayId: String(pay.id),
+          updatedAt: FieldValue.serverTimestamp(),
+          mp: {
+            ...(inv.mp || {}),
+            paymentId: pay.id,
+            status: pay.status,
+            status_detail: pay.status_detail,
+            payment_method_id: pay?.payment_method_id || null,
+            payment_type_id: pay?.payment_type_id || null,
+            payer: { id: pay?.payer?.id || null, email: pay?.payer?.email || null },
+          }
+        },
+        { merge: true }
+      );
 
-    // ===== Atualiza summary (zera pendência e marca vigência) =====
-    const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
-    await summaryRef.set(
-      {
-        lastPayment: paidAt,
-        lastAmount: Number(amount || 0),
-        activeUntil: planEnd || null,
-        nextDue: planEnd || null, // pode usar a mesma data; ajuste se preferir +1 dia
-        balance: 0,               // MUITO IMPORTANTE para getUserStatus()
-        exempt: false,
-        updatedAt: FieldValue.serverTimestamp()
-      },
-      { merge: true }
-    );
+      // Summary
+      const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
+      await summaryRef.set(
+        {
+          lastPayment: paidAt,
+          lastAmount: Number(amount || 0),
+          activeUntil: planEnd || null,
+          nextDue: planEnd || null, // ajuste se preferir +1 dia
+          balance: 0,
+          exempt: false,
+          updatedAt: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
 
-    // ===== Atualiza perfil do usuário =====
-    const userRef = db.collection("users").doc(uid);
-    await userRef.set(
-      {
-        ativo: true,
-        // texto sem "pend" para não conflitar com seu getUserStatus()
-        status: "Em dia",
-        updatedAt: FieldValue.serverTimestamp()
-      },
-      { merge: true }
-    );
+      // Perfil do usuário
+      const userRef = db.collection("users").doc(uid);
+      await userRef.set(
+        {
+          ativo: true,
+          status: "Em dia",
+          updatedAt: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
 
-    return res.status(200).send("ok");
+      return res.status(200).send("ok");
+    }
+
+    if (isExpiredOrCancelled) {
+      // Marcar fatura como expirada/cancelada (útil para boleto vencido)
+      await invRef.set(
+        {
+          status: "expirado",
+          updatedAt: FieldValue.serverTimestamp(),
+          mp: {
+            ...(inv.mp || {}),
+            paymentId: pay.id,
+            status: pay.status,
+            status_detail: pay.status_detail
+          }
+        },
+        { merge: true }
+      );
+      return res.status(200).send("expired");
+    }
+
+    // Outros estados (pending, in_process, etc.) — não alteramos nada
+    return res.status(200).send("ignored");
   } catch (e) {
     console.error("MP webhook error", e);
     return res.status(500).send("error");
