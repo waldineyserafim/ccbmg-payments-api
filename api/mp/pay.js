@@ -97,7 +97,9 @@ export default async function handler(req, res){
         dueDate:   Timestamp.fromDate(end),
         amount,
         status: "em_aberto",
-        recordedAt: FieldValue.serverTimestamp()
+        recordedAt: FieldValue.serverTimestamp(),
+        // (opcional) guarda quantos meses para auditoria
+        months: PLAN_MONTHS[planType]
       });
 
     // ===== Normaliza campos do Brick (suporta snake_case e camelCase)
@@ -235,15 +237,27 @@ export default async function handler(req, res){
     }
     await invRef.set(patch, { merge:true });
 
-    // Atualiza summary (próximo vencimento)
+    // ===== Atualiza summary (próximo vencimento)
+    // >>> ADIÇÃO: balance=0 e activeUntil=end quando aprovado (fecha o ciclo para liberar acesso)
     const summaryRef = db.collection("users").doc(uid).collection("finance").doc("summary");
     await summaryRef.set({
       planType,
       lastPayment: approved ? (patch.paidAt || FieldValue.serverTimestamp()) : FieldValue.serverTimestamp(),
       lastAmount: amount,
       nextDue: Timestamp.fromDate(end),
-      updatedAt: FieldValue.serverTimestamp()
+      updatedAt: FieldValue.serverTimestamp(),
+      ...(approved ? { balance: 0, activeUntil: Timestamp.fromDate(end), exempt: false } : {})
     }, { merge:true });
+
+    // >>> ADIÇÃO: se aprovado, garante perfil ativo e status "Em dia"
+    if (approved) {
+      const userRef = db.collection("users").doc(uid);
+      await userRef.set({
+        ativo: true,
+        status: "Em dia",
+        updatedAt: FieldValue.serverTimestamp()
+      }, { merge: true });
+    }
 
     // Próxima ação para PIX/BOLETO (retorna códigos copiáveis)
     let next_action = null;
